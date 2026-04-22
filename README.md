@@ -7,6 +7,10 @@
 
 This repository contains the infrastructure that powers the E2B platform.
 
+## Architecture
+
+See [ARCHITECTURE.md](./ARCHITECTURE.md) for a high-level design overview, service breakdown, and sequence diagrams for the main sandbox lifecycle flows (create, connect, pause, resume, template build).
+
 ## Contributing
 
 See [CONTRIBUTING.md](./CONTRIBUTING.md) for ways you can contribute to E2B Infrastructure.
