@@ -201,7 +201,7 @@ sequenceDiagram
   Node->>Node: check maxSandboxesPerNode / startingSandboxes semaphore
   Node->>Node: templateCache.GetTemplate(buildID) (GCS-backed, chunked)
   Node->>FC: allocate TAP veth, iptables, NBD rootfs, UFFD memfile
-  Node->>FC: jailer + firecracker start (snapshot restore if resume)
+  Node->>FC: unshare -m + ip netns exec -> firecracker (snapshot restore if resume)
   Node->>Envd: HTTP health probe on :49983 (wait for ready)
   Envd-->>Node: ready
   Node->>Redis: sandbox-catalog.Put(sandboxID -> nodeIP)
@@ -396,7 +396,7 @@ layered components. You can view them as subsystems:
 flowchart LR
   subgraph SandboxLifecycle["Sandbox lifecycle object (pkg/sandbox/sandbox.go)"]
     S["Sandbox\n(Config, Runtime, Slot)"]
-    S --> FCd["fc/\nFirecracker API,\njailer, socket"]
+    S --> FCd["fc/\nFirecracker API,\nprocess launch, socket"]
     S --> NET["network/\nTAP, veth, iptables,\nrouting, DNS"]
     S --> NBDs["nbd/\nUser-space block device\n(rootfs COW chunks)"]
     S --> UFFDs["uffd/\nuserfaultfd handler\n(memfile pages,\nprefetcher)"]
@@ -419,7 +419,57 @@ flowchart LR
 
 ---
 
-## 6. Authentication model
+## 6. Sandbox isolation model (does *not* use Firecracker `jailer`)
+
+E2B **does not** use the Firecracker [`jailer`](https://github.com/firecracker-microvm/firecracker/blob/main/docs/jailer.md)
+binary. The orchestrator launches `firecracker` directly and reimplements the
+jailer's responsibilities in Go, with a few additions (NBD/UFFD, egress proxy,
+atomic cgroup placement).
+
+Exact launch command (see
+[`packages/orchestrator/pkg/sandbox/fc/script_builder.go`](./packages/orchestrator/pkg/sandbox/fc/script_builder.go)
+and [`fc/process.go`](./packages/orchestrator/pkg/sandbox/fc/process.go)):
+
+```bash
+unshare -m -- bash -c '
+  mount --make-rprivate / &&
+  mount -t tmpfs tmpfs <SandboxDir> -o X-mount.mkdir &&
+  ln -s <HostRootfsPath> <SandboxDir>/<rootfs> &&
+  ln -s <HostKernelPath>  <SandboxDir>/<kernelDir>/<kernel> &&
+  ip netns exec <NamespaceID> <FirecrackerPath> --api-sock <FirecrackerSocket>
+'
+```
+
+…spawned with `SysProcAttr{Setsid: true, UseCgroupFD: true, CgroupFD: ...}` so
+the FC child lands in the correct cgroup atomically via `CLONE_INTO_CGROUP`.
+
+Isolation layers applied per sandbox:
+
+| Layer | Implementation |
+|---|---|
+| Hardware virtualization | KVM (primary boundary) |
+| Hypervisor syscall filter | Firecracker's built-in seccomp filter (enabled by default in FC) |
+| Network namespace | `network.Slot` allocates a per-sandbox netns; FC launched via `ip netns exec` (`pkg/sandbox/network/`) |
+| Mount namespace | `unshare -m` + `mount --make-rprivate /` + tmpfs + symlinks so the VM only sees its own files |
+| cgroup v2 | Per-sandbox cgroup, atomic placement through `CLONE_INTO_CGROUP` (`pkg/sandbox/cgroup/manager.go`) |
+| Session isolation | `Setsid: true` on the FC process |
+| Per-sandbox firewall | `iptables` rules inside the netns + user-space egress proxy for domain allow-lists (`pkg/sandbox/network/firewall.go`, `egressproxy.go`) |
+| Rate limiting | Native Firecracker token-bucket rate limiters on TAP + drive devices (`fc.RateLimiterConfig`) |
+| Storage indirection | Rootfs served via **NBD** (`pkg/sandbox/nbd/`), memory via **UFFD** (`pkg/sandbox/uffd/`) — FC never sees the raw backing files |
+| Inside-VM resource caps | `envd` cgroup v2 manager applies `cpu.weight` / `memory.high` / `memory.max` to PTY, socat, and user process groups (`packages/envd/main.go:createCgroupManager`) |
+
+What is **not** done (vs. jailer defaults):
+
+- FC does not run as an unprivileged UID/GID — the orchestrator requires root
+  (`CLAUDE.md`: "Orchestrator requires sudo"). Unprivileged drop would
+  complicate TAP/NBD/UFFD setup, so the project relies on the KVM + seccomp
+  boundary instead.
+- No `chroot` on the FC process itself. The `pkg/chrooted/` package is used
+  only for template-build rootfs manipulation and the NFS proxy
+  (`pkg/nfsproxy/chroot/`), not for sandbox runtime.
+- No AppArmor / SELinux profile is added by the orchestrator.
+
+## 7. Authentication model
 
 From `spec/openapi.yml` + `packages/auth`:
 
@@ -435,7 +485,7 @@ before the team (see the comment near the top of `spec/openapi.yml`).
 
 ---
 
-## 7. Observability, deployment, CI
+## 8. Observability, deployment, CI
 
 - **Telemetry.** Every service calls `telemetry.New(...)` at boot → OTEL SDK →
   collector → Loki / Tempo / Mimir. See `packages/shared/pkg/telemetry` and
@@ -457,7 +507,7 @@ before the team (see the comment near the top of `spec/openapi.yml`).
 
 ---
 
-## 8. The "happy path" in one diagram
+## 9. The "happy path" in one diagram
 
 ```mermaid
 sequenceDiagram
@@ -492,7 +542,7 @@ sequenceDiagram
 
 ---
 
-## 9. Where to read next
+## 10. Where to read next
 
 If you want to keep drilling down:
 
